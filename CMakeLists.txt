@@ -30,30 +30,33 @@ if(NOT TARGET FairLogger::FairLogger)
     find_package(FairLogger)
 endif()
 
-# ------------------------------------------------------------------------------
-# Include Directories
-# ------------------------------------------------------------------------------
-set(NESTDAQ_USER_IMPL_DIR "/home/unidaq/nestdaq/src/nestdaq-user-impl")
-set(NESTDAQ_UNPACKER_SRC_DIR "/home/unidaq/repos/NestdaqUnpacker/src")
+set(NESTDAQ_USER_IMPL_DIR ${CMAKE_SOURCE_DIR})
+set(NESTDAQ_UNPACKER_DIR ${CMAKE_SOURCE_DIR}/unpacker)
 
-include_directories(
-    ${NESTDAQ_USER_IMPL_DIR}
-    ${NESTDAQ_UNPACKER_SRC_DIR}
-    ${CMAKE_SOURCE_DIR}/NestdaqTFSlicer
-    ${FairMQ_INCLUDE_DIRS}
-    ${ROOT_INCLUDE_DIRS}
-    ${Boost_INCLUDE_DIRS}
-)
-
-# ------------------------------------------------------------------------------
-# Link Directories
-# ------------------------------------------------------------------------------
-link_directories(
-    ${FairMQ_LIBDIR}
-    ${FairLogger_LIBDIR}
-    ${Boost_LIBRARY_DIRS}
-    ${ROOT_LIBRARY_DIRS}
-)
+## ------------------------------------------------------------------------------
+## Include Directories
+## ------------------------------------------------------------------------------
+#set(NESTDAQ_USER_IMPL_DIR "/home/unidaq/nestdaq/src/nestdaq-user-impl")
+#set(NESTDAQ_UNPACKER_SRC_DIR "/home/unidaq/repos/NestdaqUnpacker/src")
+#
+#include_directories(
+#    ${NESTDAQ_USER_IMPL_DIR}
+#    ${NESTDAQ_UNPACKER_SRC_DIR}
+#    ${CMAKE_SOURCE_DIR}/NestdaqTFSlicer
+#    ${FairMQ_INCLUDE_DIRS}
+#    ${ROOT_INCLUDE_DIRS}
+#    ${Boost_INCLUDE_DIRS}
+#)
+#
+## ------------------------------------------------------------------------------
+## Link Directories
+## ------------------------------------------------------------------------------
+#link_directories(
+#    ${FairMQ_LIBDIR}
+#    ${FairLogger_LIBDIR}
+#    ${Boost_LIBRARY_DIRS}
+#    ${ROOT_LIBRARY_DIRS}
+#)
 
 # ------------------------------------------------------------------------------
 # Subdirectories
