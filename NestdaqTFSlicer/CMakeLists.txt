@@ -21,5 +21,10 @@ target_link_libraries(NestdaqTFSlicer
     FairLogger::FairLogger
 )
 
+install(TARGETS NestdaqTFSlicer
+    LIBRARY DESTINATION lib64
+    ARCHIVE DESTINATION lib64
+)
+
 # KTimer is header-only (included in source), so we don't compile it here to avoid duplication.
 # It is available to other targets via include_directories in top CMake.
