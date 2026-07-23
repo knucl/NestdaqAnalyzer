@@ -308,13 +308,13 @@ struct OnlineAnalysisNode : fair::mq::Device
                                         fMapTDC[fem_id][ch]->Fill(tdc);
                                         fMapTOT[fem_id][ch]->Fill(tot);
                                     }
-LOG(info) << std::hex << fem_id << " " << std::dec << ch;
+//LOG(info) << std::hex << fem_id << " " << std::dec << ch;
                                     const auto& detector = channel_map.get("detector", {chmap::number_t(fem_id),
                                                                                         chmap::number_t(ch)});
                                     try {
                                         const auto det_id = std::get<chmap::number_t>(detector["id"]);
                                         const auto det_ch = std::get<chmap::number_t>(detector["channel"]);
-LOG(info) << det_id << " " << det_ch;
+//LOG(info) << det_id << " " << det_ch;
                                         fMapHitPatternDetector[det_id]->Fill(det_ch);
                                     } catch (const std::out_of_range& e) {
                                         std::cerr << "Not registered: FE ID: " << fem_id << ", FE ch: " << ch << std::endl;
