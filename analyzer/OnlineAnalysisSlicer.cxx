@@ -105,6 +105,9 @@ struct OnlineAnalysisTrigger : fair::mq::Device
         for (auto& [id, vec] : fMapTOT) {
             for (auto* h : vec) if (h) h->Reset();
         }
+        for (auto& [id, h] : fMapChTDC) {
+            if (h) h->Reset();
+        }
         fLastTrigTime = 0;
         fFirstTrigTime = 0;
         fMsgCount = 0;
@@ -247,6 +250,7 @@ struct OnlineAnalysisTrigger : fair::mq::Device
                         
                         fMapTDC[fem_id][ch]->Fill(final_diff);
                         fMapTOT[fem_id][ch]->Fill(tot);
+												fMapChTDC[fem_id]->Fill(ch, final_diff);
                     }
                 } 
                 fMapMultiplicity[fem_id]->Fill(multiplicity);
@@ -339,10 +343,18 @@ struct OnlineAnalysisTrigger : fair::mq::Device
             fCanvasesTOT[fem_id][page]->cd(pad);
             fMapTOT[fem_id][i]->Draw();
         }
+if (is_hr) {
+	fMapChTDC[fem_id] = new TH2F(Form("h2_ch_tdc_%s", ip_str.c_str()), Form("FEM %s;[Ch];Rel Time [ps]", ip_str.c_str()),
+	                             max_ch, 0, max_ch, 2000, -1000000, 1000000);
+} else {
+	fMapChTDC[fem_id] = new TH2F(Form("h2_ch_tdc_%s", ip_str.c_str()), Form("FEM %s;[Ch];Rel Time [ns]", ip_str.c_str()),
+	                             max_ch, 0, max_ch, 2000, -1000, 1000);
+}
 
         if (fServer) {
             fServer->Register(Form("/FEM_%s", ip_str.c_str()), fMapHitPattern[fem_id]);
             fServer->Register(Form("/FEM_%s", ip_str.c_str()), fMapMultiplicity[fem_id]);
+            fServer->Register(Form("/FEM_%s", ip_str.c_str()), fMapChTDC[fem_id]);
             fServer->SetItemField(Form("/FEM_%s", ip_str.c_str()), "_monitoring", "1000");
         }
     }
@@ -368,6 +380,7 @@ private:
     std::map<uint32_t, TH1F*> fMapMultiplicity;
     std::map<uint32_t, std::vector<TH1F*>> fMapTDC;
     std::map<uint32_t, std::vector<TH1F*>> fMapTOT;
+    std::map<uint32_t, TH2F*> fMapChTDC;
     
     // Summary Canvases
     TCanvas* fCanvasSummary = nullptr;
