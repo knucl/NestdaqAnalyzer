@@ -83,6 +83,7 @@ struct OnlineAnalysisNode : fair::mq::Device
         }
         
         channel_map.initialize(fChannelMapName);
+        CreateDetectorHistograms();
 
         LOG(info) << "DEBUG: InitTask Finished.";
     }
@@ -91,6 +92,50 @@ struct OnlineAnalysisNode : fair::mq::Device
     {
         LOG(info) << "OnlineAnalysisNode: PreRun - Resetting histograms for new run.";
         ResetHistograms();
+    }
+
+    // Detector histograms are created once, after the channel map is loaded.
+    // PreRun only resets them; re-creating them there made ROOT replace the
+    // displayed objects while Fill() kept writing to the first ones.
+    void CreateDetectorHistograms()
+    {
+        if (!fMapHitPatternDetector.empty()) return;
+
+        struct HistInfo {
+            TString title;
+            TString name;
+            int     min_ch;
+            int     max_ch;
+        };
+        std::map<int, HistInfo> hist_info;
+        const auto detector_map = channel_map.get("detector");
+        for (const auto& [fe, detector] : detector_map) {
+            const auto id      = std::get<chmap::number_t>(detector["id"]);
+            const auto plane   = std::get<chmap::number_t>(detector["plane"]);
+            const auto segment = std::get<chmap::number_t>(detector["segment"]);
+            const auto ch      = std::get<chmap::number_t>(detector["channel"]);
+            const auto data    = std::get<std::string>(detector["data"]);
+            if (hist_info.count(id) == 0) {
+                const TString title = Form("%s, plane: %lld, seg.: %lld;channel;counts",
+                                           data.c_str(), (long long)plane, (long long)segment);
+                hist_info.emplace(id, HistInfo{title, data.c_str(), (int)ch, (int)ch});
+            } else {
+                if (hist_info[id].min_ch > ch) hist_info[id].min_ch = ch;
+                if (hist_info[id].max_ch < ch) hist_info[id].max_ch = ch;
+            }
+        }
+        for (const auto& [id, info] : hist_info) {
+            auto* h = new TH1F(Form("h_detector_profile_%d", id), info.title,
+                               info.max_ch - info.min_ch + 1, info.min_ch - 0.5, info.max_ch + 0.5);
+            fMapHitPatternDetector.emplace(id, h);
+            if (fServer) {
+                fServer->Register(Form("/Detector/%s", info.name.Data()), h);
+            }
+        }
+        if (fServer) {
+            fServer->SetItemField("/Detector", "_monitoring", "1000");
+        }
+        LOG(info) << "Created " << fMapHitPatternDetector.size() << " detector histograms from the channel map.";
     }
 
     void ResetHistograms()
@@ -106,35 +151,8 @@ struct OnlineAnalysisNode : fair::mq::Device
             for (auto* h : vec) if (h) h->Reset();
         }
         
-        struct HistInfo {
-            TString title;
-            int     min_ch;
-            int     max_ch;
-        };
-        std::map<int, HistInfo> hist_info;
-        const auto detector_map = channel_map.get("detector");
-        for (const auto& [fe, detector] : detector_map) {
-            const auto id      = std::get<chmap::number_t>(detector["id"]);
-            const auto plane   = std::get<chmap::number_t>(detector["plane"]);
-            const auto segment = std::get<chmap::number_t>(detector["segment"]);
-            const auto ch      = std::get<chmap::number_t>(detector["channel"]);
-            const auto data    = std::get<std::string>(detector["data"]);
-            const auto title = Form("%s, plane: %d, seg.: %d", data.c_str(), plane, segment);
-            if (hist_info.count(id) == 0) {
-                hist_info.emplace(id, HistInfo{title, ch, ch});
-            } else {
-                if (hist_info[id].min_ch > ch) {
-                    hist_info[id].min_ch = ch;
-                }
-                if (hist_info[id].max_ch < ch) {
-                    hist_info[id].max_ch = ch;
-                }
-            }
-        }
-        for (const auto& [id, info] : hist_info) {
-            fMapHitPatternDetector.emplace(id,
-                                           new TH1F(Form("h_detector_profile_%d", id), info.title,
-                                                    info.max_ch - info.min_ch + 1, info.min_ch - 0.5, info.max_ch + 0.5));
+        for (auto& [id, h] : fMapHitPatternDetector) {
+            if (h) h->Reset();
         }
 
         fProcessCount = 0;
