@@ -1,6 +1,7 @@
 #include <fairmq/Device.h>
 #include <fairmq/runDevice.h>
 
+#include <algorithm>
 #include <cctype>
 #include <filesystem>
 #include <iomanip>
@@ -106,12 +107,14 @@ struct OnlineAnalysisNode : fair::mq::Device
     }
 
     // ---- channel map -------------------------------------------------------
-    // One set of histograms per detector, plane and data kind. The x axis is
-    // segment x ch (bin = segment index * number of ch + ch index).
+    // One set of histograms per detector, plane and data kind: a hit pattern
+    // over segment x ch (bin = segment index * number of ch + ch index), and
+    // one TDC and one TOT histogram per channel, laid out on 8x4 canvases.
     struct DetHists {
         TH1F* hitpat = nullptr;
-        TH2F* tdc    = nullptr;  // made at the first hit, with the TDC range of its FE type
-        TH2F* tot    = nullptr;
+        std::vector<TH1F*> tdc;  // per channel; made at the first hit, with the TDC range of its FE type
+        std::vector<TH1F*> tot;
+        std::vector<TCanvas*> canvases;
         std::string dir;         // THttpServer folder
         std::string name;        // ROOT name stem
         std::string title;
@@ -178,7 +181,14 @@ struct OnlineAnalysisNode : fair::mq::Device
     void DeleteDetectorHistograms()
     {
         for (auto& h : fDetHists) {
-            for (TH1* p : {static_cast<TH1*>(h.hitpat), static_cast<TH1*>(h.tdc), static_cast<TH1*>(h.tot)}) {
+            for (auto* c : h.canvases) {   // canvases first: they draw the histograms below
+                if (fServer) fServer->Unregister(c);
+                delete c;
+            }
+            std::vector<TH1*> all{h.hitpat};
+            all.insert(all.end(), h.tdc.begin(), h.tdc.end());
+            all.insert(all.end(), h.tot.begin(), h.tot.end());
+            for (TH1* p : all) {
                 if (!p) continue;
                 if (fServer) fServer->Unregister(p);
                 delete p;
@@ -188,18 +198,22 @@ struct OnlineAnalysisNode : fair::mq::Device
         fDetOffset.clear();
     }
 
-    // Bin labels such as "0U", "0D", "1U", or "3-12" for numeric ch, when they are few enough to read.
+    // Channel name such as "0U", "0D", "1U", or "3-12" when ch is a number.
+    static std::string ChannelLabel(const chmap::DeviceDef& d, const DetHists& h, int bin)
+    {
+        const int nch = d.chs.size();
+        const std::string seg = h.use_seg ? d.segments[bin / nch] : "";
+        const std::string ch  = h.use_ch  ? d.chs[bin % nch] : "";
+        const bool numeric_ch = !ch.empty() && std::isdigit(static_cast<unsigned char>(ch[0]));
+        const std::string label = (h.use_seg && numeric_ch) ? seg + "-" + ch : seg + ch;
+        return label.empty() ? std::to_string(bin) : label;
+    }
+
+    // Bin labels on the hit pattern, when they are few enough to read.
     static void LabelAxis(TAxis* axis, const chmap::DeviceDef& d, const DetHists& h)
     {
         if (h.nbins > 64) return;
-        const int nch = d.chs.size();
-        for (int b = 0; b < h.nbins; ++b) {
-            const std::string seg = h.use_seg ? d.segments[b / nch] : "";
-            const std::string ch  = h.use_ch  ? d.chs[b % nch] : "";
-            const bool numeric_ch = !ch.empty() && std::isdigit(static_cast<unsigned char>(ch[0]));
-            const std::string label = (h.use_seg && numeric_ch) ? seg + "-" + ch : seg + ch;
-            if (!label.empty()) axis->SetBinLabel(b + 1, label.c_str());
-        }
+        for (int b = 0; b < h.nbins; ++b) axis->SetBinLabel(b + 1, ChannelLabel(d, h, b).c_str());
     }
 
     void RebuildDetectorHistograms()
@@ -236,15 +250,41 @@ struct OnlineAnalysisNode : fair::mq::Device
     {
         const double tdc_max = is_hr ? 600000000.0 : 250000.0;
         const double tot_max = is_hr ? 100000.0 : 200.0;
-        h.tdc = new TH2F(("h_" + h.name + "_tdc").c_str(), (h.title + " TDC;" + h.xtitle + ";TDC").c_str(),
-                         h.nbins, 0, h.nbins, 200, 0, tdc_max);
-        h.tot = new TH2F(("h_" + h.name + "_tot").c_str(), (h.title + " TOT;" + h.xtitle + ";TOT").c_str(),
-                         h.nbins, 0, h.nbins, 200, 0, tot_max);
-        LabelAxis(h.tdc->GetXaxis(), d, h);
-        LabelAxis(h.tot->GetXaxis(), d, h);
-        if (fServer) {
-            fServer->Register(h.dir.c_str(), h.tdc);
-            fServer->Register(h.dir.c_str(), h.tot);
+        h.tdc.assign(h.nbins, nullptr);
+        h.tot.assign(h.nbins, nullptr);
+        for (int b = 0; b < h.nbins; ++b) {
+            const std::string label = ChannelLabel(d, h, b);
+            const std::string tag   = Sanitize(label);
+            h.tdc[b] = new TH1F(("h_" + h.name + "_tdc_" + tag).c_str(),
+                                (h.title + " " + label + " TDC;TDC;counts").c_str(), 1000, 0, tdc_max);
+            h.tot[b] = new TH1F(("h_" + h.name + "_tot_" + tag).c_str(),
+                                (h.title + " " + label + " TOT;TOT;counts").c_str(), 1000, 0, tot_max);
+            if (fServer) {
+                fServer->Register((h.dir + "/TDC").c_str(), h.tdc[b]);
+                fServer->Register((h.dir + "/TOT").c_str(), h.tot[b]);
+            }
+        }
+        // 32 channels per canvas, 8x4, as for the FEM view
+        for (int first = 0; first < h.nbins; first += 32) {
+            const int last = std::min(first + 32, h.nbins) - 1;
+            const std::string range = ChannelLabel(d, h, first) + " - " + ChannelLabel(d, h, last);
+            for (const bool is_tot : {false, true}) {
+                const std::string kind = is_tot ? "tot" : "tdc";
+                auto* c = new TCanvas(("c_" + h.name + "_" + kind + "_" + std::to_string(first / 32)).c_str(),
+                                      (h.title + (is_tot ? " TOT " : " TDC ") + range).c_str(), 1600, 1000);
+                c->Divide(8, 4);
+                for (int b = first; b <= last; ++b) {
+                    c->cd(b - first + 1);
+                    if (is_tot) {
+                        if (auto* pad = c->GetPad(b - first + 1)) pad->SetLogy(1);
+                        h.tot[b]->Draw();
+                    } else {
+                        h.tdc[b]->Draw();
+                    }
+                }
+                h.canvases.push_back(c);
+                if (fServer) fServer->Register((h.dir + "/Canvases").c_str(), c);
+            }
         }
     }
 
@@ -254,9 +294,9 @@ struct OnlineAnalysisNode : fair::mq::Device
         auto& h = fDetHists[fDetOffset[a.device] + a.plane * d.datas.size() + a.data];
         const int bin = a.segment * d.chs.size() + a.ch;
         h.hitpat->Fill(bin);
-        if (!h.tdc) CreateDetectorTimeHistograms(h, d, is_hr);
-        h.tdc->Fill(bin, tdc);
-        h.tot->Fill(bin, tot);
+        if (h.tdc.empty()) CreateDetectorTimeHistograms(h, d, is_hr);
+        h.tdc[bin]->Fill(tdc);
+        h.tot[bin]->Fill(tot);
     }
 
     void FillUnmapped(uint32_t fem_id, uint32_t ch)
@@ -283,8 +323,8 @@ struct OnlineAnalysisNode : fair::mq::Device
         
         for (auto& h : fDetHists) {
             if (h.hitpat) h.hitpat->Reset();
-            if (h.tdc) h.tdc->Reset();
-            if (h.tot) h.tot->Reset();
+            for (auto* p : h.tdc) if (p) p->Reset();
+            for (auto* p : h.tot) if (p) p->Reset();
         }
         if (fH2Unmapped) fH2Unmapped->Reset();
         fUnmappedSeen.clear();
@@ -633,7 +673,9 @@ struct OnlineAnalysisNode : fair::mq::Device
 
     void UpdateDisplay()
     {
-        for (auto* c : fCanvases) {
+        std::vector<TCanvas*> all_canvases = fCanvases;
+        for (const auto& h : fDetHists) all_canvases.insert(all_canvases.end(), h.canvases.begin(), h.canvases.end());
+        for (auto* c : all_canvases) {
             if (c) {
                 for(int i=0; i<32; ++i) { 
                    auto* pad = c->GetPad(i+1);
