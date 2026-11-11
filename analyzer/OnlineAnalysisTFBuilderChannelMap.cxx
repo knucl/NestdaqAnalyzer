@@ -1,7 +1,10 @@
 #include <fairmq/Device.h>
 #include <fairmq/runDevice.h>
 
+#include <cctype>
+#include <filesystem>
 #include <iomanip>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -23,7 +26,7 @@
 // Helper timer
 #include "KTimer.cxx"
 
-#include "channel_map.hpp"
+#include "detector_map.hpp"
 
 namespace bpo = boost::program_options;
 
@@ -34,11 +37,11 @@ struct OnlineAnalysisNode : fair::mq::Device
         static constexpr std::string_view SamplingMode     {"sampling-mode"};
         static constexpr std::string_view Prescale         {"prescale"};
         static constexpr std::string_view ChannelMapName   {"channel-map"};
+        static constexpr std::string_view DefinitionName   {"detector-definition"};
     };
 
     OnlineAnalysisNode()
-        : fLeafProcessor(new nestdaq::unpacker::LeafProcessor()),
-          channel_map(chmap::ChannelMap::get_instance())
+        : fLeafProcessor(new nestdaq::unpacker::LeafProcessor())
     {
     }
 
@@ -49,8 +52,9 @@ struct OnlineAnalysisNode : fair::mq::Device
         fSamplingMode     = fConfig->GetValue<std::string>(opt::SamplingMode.data());
         fPrescale         = fConfig->GetValue<int>(opt::Prescale.data());
         fChannelMapName   = fConfig->GetValue<std::string>(opt::ChannelMapName.data());
+        fDefinitionName   = fConfig->GetValue<std::string>(opt::DefinitionName.data());
 //        LOG(info) << "DEBUG: InitTask Started. Channel: " << fInputChannelName << " Mode: " << fSamplingMode << " Prescale: " << fPrescale;
-        LOG(info) << "DEBUG: InitTask Started. Channel: " << fInputChannelName << " Mode: " << fSamplingMode << " Prescale: " << fPrescale << " channel map: " << fChannelMapName;
+        LOG(info) << "DEBUG: InitTask Started. Channel: " << fInputChannelName << " Mode: " << fSamplingMode << " Prescale: " << fPrescale << " detector definition: " << fDefinitionName << " channel map: " << fChannelMapName;
 
         gROOT->SetBatch(kTRUE);
 
@@ -82,8 +86,14 @@ struct OnlineAnalysisNode : fair::mq::Device
             fH2HitPattern->Reset();
         }
         
-        channel_map.initialize(fChannelMapName);
-        CreateDetectorHistograms();
+        // Hits on FE channels that the channel map does not know (FE channel x FE board)
+        if (!fH2Unmapped) {
+            fH2Unmapped = new TH2F("h2_unmapped", "Hits on FE channels not in the channel map;FE channel;FE board",
+                                   128, 0, 128, 1, 0, 1);
+            fH2Unmapped->SetCanExtend(TH1::kYaxis);
+            if (fServer) fServer->Register("/Detector", fH2Unmapped);
+        }
+        ReloadDetectorMap();
 
         LOG(info) << "DEBUG: InitTask Finished.";
     }
@@ -91,51 +101,171 @@ struct OnlineAnalysisNode : fair::mq::Device
     void PreRun() override
     {
         LOG(info) << "OnlineAnalysisNode: PreRun - Resetting histograms for new run.";
+        ReloadDetectorMap();
         ResetHistograms();
     }
 
-    // Detector histograms are created once, after the channel map is loaded.
-    // PreRun only resets them; re-creating them there made ROOT replace the
-    // displayed objects while Fill() kept writing to the first ones.
-    void CreateDetectorHistograms()
-    {
-        if (!fMapHitPatternDetector.empty()) return;
+    // ---- channel map -------------------------------------------------------
+    // One set of histograms per detector, plane and data kind. The x axis is
+    // segment x ch (bin = segment index * number of ch + ch index).
+    struct DetHists {
+        TH1F* hitpat = nullptr;
+        TH2F* tdc    = nullptr;  // made at the first hit, with the TDC range of its FE type
+        TH2F* tot    = nullptr;
+        std::string dir;         // THttpServer folder
+        std::string name;        // ROOT name stem
+        std::string title;
+        std::string xtitle;
+        int  nbins   = 0;
+        bool use_seg = false;
+        bool use_ch  = false;
+    };
+    using MapStamp = std::pair<std::filesystem::file_time_type, std::filesystem::file_time_type>;
 
-        struct HistInfo {
-            TString title;
-            TString name;
-            int     min_ch;
-            int     max_ch;
-        };
-        std::map<int, HistInfo> hist_info;
-        const auto detector_map = channel_map.get("detector");
-        for (const auto& [fe, detector] : detector_map) {
-            const auto id      = std::get<chmap::number_t>(detector["id"]);
-            const auto plane   = std::get<chmap::number_t>(detector["plane"]);
-            const auto segment = std::get<chmap::number_t>(detector["segment"]);
-            const auto ch      = std::get<chmap::number_t>(detector["channel"]);
-            const auto data    = std::get<std::string>(detector["data"]);
-            if (hist_info.count(id) == 0) {
-                const TString title = Form("%s, plane: %lld, seg.: %lld;channel;counts",
-                                           data.c_str(), (long long)plane, (long long)segment);
-                hist_info.emplace(id, HistInfo{title, data.c_str(), (int)ch, (int)ch});
+    static std::string Sanitize(const std::string& s)
+    {
+        std::string r;
+        for (char c : s) r += std::isalnum(static_cast<unsigned char>(c)) ? c : '_';
+        return r;
+    }
+
+    MapStamp CurrentMapStamp() const
+    {
+        std::error_code ec1, ec2;
+        return {std::filesystem::last_write_time(fDefinitionName, ec1),
+                std::filesystem::last_write_time(fChannelMapName, ec2)};
+    }
+
+    // Reads the detector definition and the channel map when they changed.
+    // A map with errors is not used: the map of the previous run stays, and
+    // every problem is logged with its file and line.
+    void ReloadDetectorMap()
+    {
+        if (fDefinitionName.empty() || fChannelMapName.empty()) {
+            LOG(warn) << "Channel map is not set (detector-definition='" << fDefinitionName
+                      << "', channel-map='" << fChannelMapName << "'): no detector histograms";
+            return;
+        }
+        const auto stamp = CurrentMapStamp();
+        if (fDetMapLoaded && stamp == fDetMapStamp) {
+            LOG(info) << "Channel map unchanged since the last run";
+            return;
+        }
+        chmap::DetectorMap next;
+        const bool ok = next.load(fDefinitionName, fChannelMapName);
+        for (const auto& d : next.diagnostics()) {
+            const std::string where = d.file + (d.line > 0 ? ":" + std::to_string(d.line) : "");
+            if (d.level == chmap::Diagnostic::Level::kError) {
+                LOG(error) << where << ": " << d.message;
             } else {
-                if (hist_info[id].min_ch > ch) hist_info[id].min_ch = ch;
-                if (hist_info[id].max_ch < ch) hist_info[id].max_ch = ch;
+                LOG(warn) << where << ": " << d.message;
             }
         }
-        for (const auto& [id, info] : hist_info) {
-            auto* h = new TH1F(Form("h_detector_profile_%d", id), info.title,
-                               info.max_ch - info.min_ch + 1, info.min_ch - 0.5, info.max_ch + 0.5);
-            fMapHitPatternDetector.emplace(id, h);
-            if (fServer) {
-                fServer->Register(Form("/Detector/%s", info.name.Data()), h);
+        if (!ok) {
+            LOG(error) << "Channel map has errors: "
+                       << (fDetMapLoaded ? "keeping the map of the previous run"
+                                         : "no detector histograms until it is fixed");
+            return;
+        }
+        fDetMap = std::move(next);
+        fDetMapStamp = stamp;
+        fDetMapLoaded = true;
+        RebuildDetectorHistograms();
+        LOG(info) << "Channel map loaded: " << fDetMap.entries().size() << " FE channels, "
+                  << fDetMap.devices().size() << " detectors";
+    }
+
+    void DeleteDetectorHistograms()
+    {
+        for (auto& h : fDetHists) {
+            for (TH1* p : {static_cast<TH1*>(h.hitpat), static_cast<TH1*>(h.tdc), static_cast<TH1*>(h.tot)}) {
+                if (!p) continue;
+                if (fServer) fServer->Unregister(p);
+                delete p;
             }
         }
+        fDetHists.clear();
+        fDetOffset.clear();
+    }
+
+    // Bin labels such as "0U", "0D", "1U", or "3-12" for numeric ch, when they are few enough to read.
+    static void LabelAxis(TAxis* axis, const chmap::DeviceDef& d, const DetHists& h)
+    {
+        if (h.nbins > 64) return;
+        const int nch = d.chs.size();
+        for (int b = 0; b < h.nbins; ++b) {
+            const std::string seg = h.use_seg ? d.segments[b / nch] : "";
+            const std::string ch  = h.use_ch  ? d.chs[b % nch] : "";
+            const bool numeric_ch = !ch.empty() && std::isdigit(static_cast<unsigned char>(ch[0]));
+            const std::string label = (h.use_seg && numeric_ch) ? seg + "-" + ch : seg + ch;
+            if (!label.empty()) axis->SetBinLabel(b + 1, label.c_str());
+        }
+    }
+
+    void RebuildDetectorHistograms()
+    {
+        DeleteDetectorHistograms();
+        for (const auto& d : fDetMap.devices()) {
+            fDetOffset.push_back(fDetHists.size());
+            const bool use_plane = !(d.planes.size() == 1 && d.planes[0] == "-");
+            for (std::size_t p = 0; p < d.planes.size(); ++p) {
+                for (std::size_t x = 0; x < d.datas.size(); ++x) {
+                    DetHists h;
+                    h.use_seg = !(d.segments.size() == 1 && d.segments[0] == "-");
+                    h.use_ch  = !(d.chs.size() == 1 && d.chs[0] == "-");
+                    h.nbins   = d.segments.size() * d.chs.size();
+                    h.dir     = "/Detector/" + d.name + (use_plane ? "/" + d.planes[p] : "");
+                    h.name    = Sanitize(d.name) + (use_plane ? "_" + Sanitize(d.planes[p]) : "")
+                              + (d.datas.size() > 1 ? "_" + Sanitize(d.datas[x]) : "");
+                    h.title   = d.name + (use_plane ? " plane " + d.planes[p] : "")
+                              + (d.datas.size() > 1 ? " " + d.datas[x] : "");
+                    h.xtitle  = h.use_seg && h.use_ch ? "segment, ch" : h.use_seg ? "segment" : h.use_ch ? "ch" : "";
+                    h.hitpat  = new TH1F(("h_" + h.name + "_hitpat").c_str(),
+                                         (h.title + " hit pattern;" + h.xtitle + ";counts").c_str(),
+                                         h.nbins, 0, h.nbins);
+                    LabelAxis(h.hitpat->GetXaxis(), d, h);
+                    if (fServer) fServer->Register(h.dir.c_str(), h.hitpat);
+                    fDetHists.push_back(std::move(h));
+                }
+            }
+        }
+        if (fServer) fServer->SetItemField("/Detector", "_monitoring", "1000");
+    }
+
+    void CreateDetectorTimeHistograms(DetHists& h, const chmap::DeviceDef& d, bool is_hr)
+    {
+        const double tdc_max = is_hr ? 600000000.0 : 250000.0;
+        const double tot_max = is_hr ? 100000.0 : 200.0;
+        h.tdc = new TH2F(("h_" + h.name + "_tdc").c_str(), (h.title + " TDC;" + h.xtitle + ";TDC").c_str(),
+                         h.nbins, 0, h.nbins, 200, 0, tdc_max);
+        h.tot = new TH2F(("h_" + h.name + "_tot").c_str(), (h.title + " TOT;" + h.xtitle + ";TOT").c_str(),
+                         h.nbins, 0, h.nbins, 200, 0, tot_max);
+        LabelAxis(h.tdc->GetXaxis(), d, h);
+        LabelAxis(h.tot->GetXaxis(), d, h);
         if (fServer) {
-            fServer->SetItemField("/Detector", "_monitoring", "1000");
+            fServer->Register(h.dir.c_str(), h.tdc);
+            fServer->Register(h.dir.c_str(), h.tot);
         }
-        LOG(info) << "Created " << fMapHitPatternDetector.size() << " detector histograms from the channel map.";
+    }
+
+    void FillDetector(const chmap::Address& a, uint32_t tdc, uint32_t tot, bool is_hr)
+    {
+        const auto& d = fDetMap.devices()[a.device];
+        auto& h = fDetHists[fDetOffset[a.device] + a.plane * d.datas.size() + a.data];
+        const int bin = a.segment * d.chs.size() + a.ch;
+        h.hitpat->Fill(bin);
+        if (!h.tdc) CreateDetectorTimeHistograms(h, d, is_hr);
+        h.tdc->Fill(bin, tdc);
+        h.tot->Fill(bin, tot);
+    }
+
+    void FillUnmapped(uint32_t fem_id, uint32_t ch)
+    {
+        const std::string ip = ToIPAddress(fem_id);
+        if (fH2Unmapped) fH2Unmapped->Fill(ch, ip.c_str(), 1.);
+        if (fUnmappedSeen.insert((static_cast<uint64_t>(fem_id) << 32) | ch).second) {
+            LOG(warn) << "FE " << ip << " ch " << ch << " is not in the channel map (reported once per run)";
+        }
     }
 
     void ResetHistograms()
@@ -151,9 +281,13 @@ struct OnlineAnalysisNode : fair::mq::Device
             for (auto* h : vec) if (h) h->Reset();
         }
         
-        for (auto& [id, h] : fMapHitPatternDetector) {
-            if (h) h->Reset();
+        for (auto& h : fDetHists) {
+            if (h.hitpat) h.hitpat->Reset();
+            if (h.tdc) h.tdc->Reset();
+            if (h.tot) h.tot->Reset();
         }
+        if (fH2Unmapped) fH2Unmapped->Reset();
+        fUnmappedSeen.clear();
 
         fProcessCount = 0;
         LOG(info) << "OnlineAnalysisNode: Histograms reset completed.";
@@ -326,18 +460,12 @@ struct OnlineAnalysisNode : fair::mq::Device
                                         fMapTDC[fem_id][ch]->Fill(tdc);
                                         fMapTOT[fem_id][ch]->Fill(tot);
                                     }
-//LOG(info) << std::hex << fem_id << " " << std::dec << ch;
-                                    const auto& detector = channel_map.get("detector", {chmap::number_t(fem_id),
-                                                                                        chmap::number_t(ch)});
-                                    try {
-                                        const auto det_id = std::get<chmap::number_t>(detector["id"]);
-                                        const auto det_ch = std::get<chmap::number_t>(detector["channel"]);
-//LOG(info) << det_id << " " << det_ch;
-                                        fMapHitPatternDetector[det_id]->Fill(det_ch);
-                                    } catch (const std::out_of_range& e) {
-                                        std::cerr << "Not registered: FE ID: " << fem_id << ", FE ch: " << ch << std::endl;
-                                    } catch (const std::bad_variant_access& e) {
-                                        std::cerr << "Bad variand access : " << e.what() << std::endl;
+                                    if (fDetMapLoaded) {
+                                        if (const auto* a = fDetMap.find(static_cast<uint32_t>(fem_id), ch)) {
+                                            FillDetector(*a, tdc, tot, is_hr);
+                                        } else {
+                                            FillUnmapped(static_cast<uint32_t>(fem_id), ch);
+                                        }
                                     }
 
                                     hits_count++;
@@ -534,13 +662,19 @@ private:
    std::map<uint32_t, std::vector<TH1F*>> fMapTDC;
    std::map<uint32_t, std::vector<TH1F*>> fMapTOT;
 
-   std::map<int, TH1F*> fMapHitPatternDetector;
+   // channel map
+   std::string fDefinitionName;
+   chmap::DetectorMap fDetMap;
+   bool fDetMapLoaded = false;
+   MapStamp fDetMapStamp;
+   std::vector<DetHists> fDetHists;
+   std::vector<std::size_t> fDetOffset;   // device index -> first entry in fDetHists
+   TH2F* fH2Unmapped = nullptr;
+   std::set<uint64_t> fUnmappedSeen;
 
    std::vector<TCanvas*> fCanvases;
    
    THttpServer* fServer = nullptr;
-   
-   chmap::ChannelMap& channel_map;
 };
 
 void addCustomOptions(bpo::options_description& options)
@@ -549,7 +683,9 @@ void addCustomOptions(bpo::options_description& options)
     options.add_options()
         (opt::InputChannelName.data(), bpo::value<std::string>()->default_value("in"), "Name of the input channel")
         (opt::SamplingMode.data(), bpo::value<std::string>()->default_value("latest"), "Sampling mode: 'all' (process all) or 'latest' (drop old if slow)")
-        (opt::Prescale.data(), bpo::value<int>()->default_value(1), "Process only 1 in every N messages (default: 1, i.e., process all)");
+        (opt::Prescale.data(), bpo::value<int>()->default_value(1), "Process only 1 in every N messages (default: 1, i.e., process all)")
+        (opt::DefinitionName.data(), bpo::value<std::string>()->default_value(""), "Detector definition CSV (device, plane, segment, ch[, data])")
+        (opt::ChannelMapName.data(), bpo::value<std::string>()->default_value(""), "Channel map CSV (fe, fe.ch, device, plane, segment, ch[, data]); re-read at each run start when changed");
 }
 
 std::unique_ptr<fair::mq::Device> getDevice(fair::mq::ProgOptions& /*config*/)
