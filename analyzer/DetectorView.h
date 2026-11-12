@@ -23,6 +23,10 @@
 #ifndef NESTDAQ_ANALYZER_DETECTOR_VIEW_H_
 #define NESTDAQ_ANALYZER_DETECTOR_VIEW_H_
 
+// Default struct packing for everything below (see detector_map.hpp).
+#pragma pack(push)
+#pragma pack()
+
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
@@ -318,5 +322,7 @@ private:
     TH2F*                    fUnmapped = nullptr;
     std::set<uint64_t>       fUnmappedSeen;
 };
+
+#pragma pack(pop)
 
 #endif

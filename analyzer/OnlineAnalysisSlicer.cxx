@@ -18,10 +18,11 @@
 #include "THttpServer.h"
 
 // Project Headers
+// DetectorView.h first: TimeFrameHeader.h (via TFSlicerUnpacker.h) leaves "#pragma pack(2)" open.
+#include "DetectorView.h"
 #include "TFSlicerUnpacker.h"
 #include "UnpackTdc.h"
 #include "KTimer.cxx" 
-#include "DetectorView.h"
 
 namespace bpo = boost::program_options;
 
