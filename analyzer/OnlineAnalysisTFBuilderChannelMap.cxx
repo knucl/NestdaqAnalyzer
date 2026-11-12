@@ -1,11 +1,7 @@
 #include <fairmq/Device.h>
 #include <fairmq/runDevice.h>
 
-#include <algorithm>
-#include <cctype>
-#include <filesystem>
 #include <iomanip>
-#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -27,7 +23,7 @@
 // Helper timer
 #include "KTimer.cxx"
 
-#include "detector_map.hpp"
+#include "DetectorView.h"
 
 namespace bpo = boost::program_options;
 
@@ -87,14 +83,11 @@ struct OnlineAnalysisNode : fair::mq::Device
             fH2HitPattern->Reset();
         }
         
-        // Hits on FE channels that the channel map does not know (FE channel x FE board)
-        if (!fH2Unmapped) {
-            fH2Unmapped = new TH2F("h2_unmapped", "Hits on FE channels not in the channel map;FE channel;FE board",
-                                   128, 0, 128, 1, 0, 1);
-            fH2Unmapped->SetCanExtend(TH1::kYaxis);
-            if (fServer) fServer->Register("/Detector", fH2Unmapped);
-        }
-        ReloadDetectorMap();
+        // Detector view: raw TDC/TOT, same ranges as the FEM view; no events in a TimeFrame
+        DetectorView::Ranges hr{1000, 0, 600000000.0, 100000.0, "TDC"};
+        DetectorView::Ranges lr{1000, 0, 250000.0, 200.0, "TDC"};
+        fDetectorView.Configure(fServer, fDefinitionName, fChannelMapName, hr, lr, false);
+        fDetectorView.Reload();
 
         LOG(info) << "DEBUG: InitTask Finished.";
     }
@@ -102,210 +95,8 @@ struct OnlineAnalysisNode : fair::mq::Device
     void PreRun() override
     {
         LOG(info) << "OnlineAnalysisNode: PreRun - Resetting histograms for new run.";
-        ReloadDetectorMap();
+        fDetectorView.Reload();
         ResetHistograms();
-    }
-
-    // ---- channel map -------------------------------------------------------
-    // One set of histograms per detector, plane and data kind: a hit pattern
-    // over segment x ch (bin = segment index * number of ch + ch index), and
-    // one TDC and one TOT histogram per channel, laid out on 8x4 canvases.
-    struct DetHists {
-        TH1F* hitpat = nullptr;
-        std::vector<TH1F*> tdc;  // per channel; made at the first hit, with the TDC range of its FE type
-        std::vector<TH1F*> tot;
-        std::vector<TCanvas*> canvases;
-        std::string dir;         // THttpServer folder
-        std::string name;        // ROOT name stem
-        std::string title;
-        std::string xtitle;
-        int  nbins   = 0;
-        bool use_seg = false;
-        bool use_ch  = false;
-    };
-    using MapStamp = std::pair<std::filesystem::file_time_type, std::filesystem::file_time_type>;
-
-    static std::string Sanitize(const std::string& s)
-    {
-        std::string r;
-        for (char c : s) r += std::isalnum(static_cast<unsigned char>(c)) ? c : '_';
-        return r;
-    }
-
-    MapStamp CurrentMapStamp() const
-    {
-        std::error_code ec1, ec2;
-        return {std::filesystem::last_write_time(fDefinitionName, ec1),
-                std::filesystem::last_write_time(fChannelMapName, ec2)};
-    }
-
-    // Reads the detector definition and the channel map when they changed.
-    // A map with errors is not used: the map of the previous run stays, and
-    // every problem is logged with its file and line.
-    void ReloadDetectorMap()
-    {
-        if (fDefinitionName.empty() || fChannelMapName.empty()) {
-            LOG(warn) << "Channel map is not set (detector-definition='" << fDefinitionName
-                      << "', channel-map='" << fChannelMapName << "'): no detector histograms";
-            return;
-        }
-        const auto stamp = CurrentMapStamp();
-        if (fDetMapLoaded && stamp == fDetMapStamp) {
-            LOG(info) << "Channel map unchanged since the last run";
-            return;
-        }
-        chmap::DetectorMap next;
-        const bool ok = next.load(fDefinitionName, fChannelMapName);
-        for (const auto& d : next.diagnostics()) {
-            const std::string where = d.file + (d.line > 0 ? ":" + std::to_string(d.line) : "");
-            if (d.level == chmap::Diagnostic::Level::kError) {
-                LOG(error) << where << ": " << d.message;
-            } else {
-                LOG(warn) << where << ": " << d.message;
-            }
-        }
-        if (!ok) {
-            LOG(error) << "Channel map has errors: "
-                       << (fDetMapLoaded ? "keeping the map of the previous run"
-                                         : "no detector histograms until it is fixed");
-            return;
-        }
-        fDetMap = std::move(next);
-        fDetMapStamp = stamp;
-        fDetMapLoaded = true;
-        RebuildDetectorHistograms();
-        LOG(info) << "Channel map loaded: " << fDetMap.entries().size() << " FE channels, "
-                  << fDetMap.devices().size() << " detectors";
-    }
-
-    void DeleteDetectorHistograms()
-    {
-        for (auto& h : fDetHists) {
-            for (auto* c : h.canvases) {   // canvases first: they draw the histograms below
-                if (fServer) fServer->Unregister(c);
-                delete c;
-            }
-            std::vector<TH1*> all{h.hitpat};
-            all.insert(all.end(), h.tdc.begin(), h.tdc.end());
-            all.insert(all.end(), h.tot.begin(), h.tot.end());
-            for (TH1* p : all) {
-                if (!p) continue;
-                if (fServer) fServer->Unregister(p);
-                delete p;
-            }
-        }
-        fDetHists.clear();
-        fDetOffset.clear();
-    }
-
-    // Channel name such as "0U", "0D", "1U", or "3-12" when ch is a number.
-    static std::string ChannelLabel(const chmap::DeviceDef& d, const DetHists& h, int bin)
-    {
-        const int nch = d.chs.size();
-        const std::string seg = h.use_seg ? d.segments[bin / nch] : "";
-        const std::string ch  = h.use_ch  ? d.chs[bin % nch] : "";
-        const bool numeric_ch = !ch.empty() && std::isdigit(static_cast<unsigned char>(ch[0]));
-        const std::string label = (h.use_seg && numeric_ch) ? seg + "-" + ch : seg + ch;
-        return label.empty() ? std::to_string(bin) : label;
-    }
-
-    // Bin labels on the hit pattern, when they are few enough to read.
-    static void LabelAxis(TAxis* axis, const chmap::DeviceDef& d, const DetHists& h)
-    {
-        if (h.nbins > 64) return;
-        for (int b = 0; b < h.nbins; ++b) axis->SetBinLabel(b + 1, ChannelLabel(d, h, b).c_str());
-    }
-
-    void RebuildDetectorHistograms()
-    {
-        DeleteDetectorHistograms();
-        for (const auto& d : fDetMap.devices()) {
-            fDetOffset.push_back(fDetHists.size());
-            const bool use_plane = !(d.planes.size() == 1 && d.planes[0] == "-");
-            for (std::size_t p = 0; p < d.planes.size(); ++p) {
-                for (std::size_t x = 0; x < d.datas.size(); ++x) {
-                    DetHists h;
-                    h.use_seg = !(d.segments.size() == 1 && d.segments[0] == "-");
-                    h.use_ch  = !(d.chs.size() == 1 && d.chs[0] == "-");
-                    h.nbins   = d.segments.size() * d.chs.size();
-                    h.dir     = "/Detector/" + d.name + (use_plane ? "/" + d.planes[p] : "");
-                    h.name    = Sanitize(d.name) + (use_plane ? "_" + Sanitize(d.planes[p]) : "")
-                              + (d.datas.size() > 1 ? "_" + Sanitize(d.datas[x]) : "");
-                    h.title   = d.name + (use_plane ? " plane " + d.planes[p] : "")
-                              + (d.datas.size() > 1 ? " " + d.datas[x] : "");
-                    h.xtitle  = h.use_seg && h.use_ch ? "segment, ch" : h.use_seg ? "segment" : h.use_ch ? "ch" : "";
-                    h.hitpat  = new TH1F(("h_" + h.name + "_hitpat").c_str(),
-                                         (h.title + " hit pattern;" + h.xtitle + ";counts").c_str(),
-                                         h.nbins, 0, h.nbins);
-                    LabelAxis(h.hitpat->GetXaxis(), d, h);
-                    if (fServer) fServer->Register(h.dir.c_str(), h.hitpat);
-                    fDetHists.push_back(std::move(h));
-                }
-            }
-        }
-        if (fServer) fServer->SetItemField("/Detector", "_monitoring", "1000");
-    }
-
-    void CreateDetectorTimeHistograms(DetHists& h, const chmap::DeviceDef& d, bool is_hr)
-    {
-        const double tdc_max = is_hr ? 600000000.0 : 250000.0;
-        const double tot_max = is_hr ? 100000.0 : 200.0;
-        h.tdc.assign(h.nbins, nullptr);
-        h.tot.assign(h.nbins, nullptr);
-        for (int b = 0; b < h.nbins; ++b) {
-            const std::string label = ChannelLabel(d, h, b);
-            const std::string tag   = Sanitize(label);
-            h.tdc[b] = new TH1F(("h_" + h.name + "_tdc_" + tag).c_str(),
-                                (h.title + " " + label + " TDC;TDC;counts").c_str(), 1000, 0, tdc_max);
-            h.tot[b] = new TH1F(("h_" + h.name + "_tot_" + tag).c_str(),
-                                (h.title + " " + label + " TOT;TOT;counts").c_str(), 1000, 0, tot_max);
-            if (fServer) {
-                fServer->Register((h.dir + "/TDC").c_str(), h.tdc[b]);
-                fServer->Register((h.dir + "/TOT").c_str(), h.tot[b]);
-            }
-        }
-        // 32 channels per canvas, 8x4, as for the FEM view
-        for (int first = 0; first < h.nbins; first += 32) {
-            const int last = std::min(first + 32, h.nbins) - 1;
-            const std::string range = ChannelLabel(d, h, first) + " - " + ChannelLabel(d, h, last);
-            for (const bool is_tot : {false, true}) {
-                const std::string kind = is_tot ? "tot" : "tdc";
-                auto* c = new TCanvas(("c_" + h.name + "_" + kind + "_" + std::to_string(first / 32)).c_str(),
-                                      (h.title + (is_tot ? " TOT " : " TDC ") + range).c_str(), 1600, 1000);
-                c->Divide(8, 4);
-                for (int b = first; b <= last; ++b) {
-                    c->cd(b - first + 1);
-                    if (is_tot) {
-                        if (auto* pad = c->GetPad(b - first + 1)) pad->SetLogy(1);
-                        h.tot[b]->Draw();
-                    } else {
-                        h.tdc[b]->Draw();
-                    }
-                }
-                h.canvases.push_back(c);
-                if (fServer) fServer->Register((h.dir + "/Canvases").c_str(), c);
-            }
-        }
-    }
-
-    void FillDetector(const chmap::Address& a, uint32_t tdc, uint32_t tot, bool is_hr)
-    {
-        const auto& d = fDetMap.devices()[a.device];
-        auto& h = fDetHists[fDetOffset[a.device] + a.plane * d.datas.size() + a.data];
-        const int bin = a.segment * d.chs.size() + a.ch;
-        h.hitpat->Fill(bin);
-        if (h.tdc.empty()) CreateDetectorTimeHistograms(h, d, is_hr);
-        h.tdc[bin]->Fill(tdc);
-        h.tot[bin]->Fill(tot);
-    }
-
-    void FillUnmapped(uint32_t fem_id, uint32_t ch)
-    {
-        const std::string ip = ToIPAddress(fem_id);
-        if (fH2Unmapped) fH2Unmapped->Fill(ch, ip.c_str(), 1.);
-        if (fUnmappedSeen.insert((static_cast<uint64_t>(fem_id) << 32) | ch).second) {
-            LOG(warn) << "FE " << ip << " ch " << ch << " is not in the channel map (reported once per run)";
-        }
     }
 
     void ResetHistograms()
@@ -321,13 +112,7 @@ struct OnlineAnalysisNode : fair::mq::Device
             for (auto* h : vec) if (h) h->Reset();
         }
         
-        for (auto& h : fDetHists) {
-            if (h.hitpat) h.hitpat->Reset();
-            for (auto* p : h.tdc) if (p) p->Reset();
-            for (auto* p : h.tot) if (p) p->Reset();
-        }
-        if (fH2Unmapped) fH2Unmapped->Reset();
-        fUnmappedSeen.clear();
+        fDetectorView.Reset();
 
         fProcessCount = 0;
         LOG(info) << "OnlineAnalysisNode: Histograms reset completed.";
@@ -500,13 +285,7 @@ struct OnlineAnalysisNode : fair::mq::Device
                                         fMapTDC[fem_id][ch]->Fill(tdc);
                                         fMapTOT[fem_id][ch]->Fill(tot);
                                     }
-                                    if (fDetMapLoaded) {
-                                        if (const auto* a = fDetMap.find(static_cast<uint32_t>(fem_id), ch)) {
-                                            FillDetector(*a, tdc, tot, is_hr);
-                                        } else {
-                                            FillUnmapped(static_cast<uint32_t>(fem_id), ch);
-                                        }
-                                    }
+                                    fDetectorView.Fill(static_cast<uint32_t>(fem_id), ch, tdc, tot, is_hr);
 
                                     hits_count++;
                                 }
@@ -673,9 +452,7 @@ struct OnlineAnalysisNode : fair::mq::Device
 
     void UpdateDisplay()
     {
-        std::vector<TCanvas*> all_canvases = fCanvases;
-        for (const auto& h : fDetHists) all_canvases.insert(all_canvases.end(), h.canvases.begin(), h.canvases.end());
-        for (auto* c : all_canvases) {
+        for (auto* c : fCanvases) {
             if (c) {
                 for(int i=0; i<32; ++i) { 
                    auto* pad = c->GetPad(i+1);
@@ -684,6 +461,7 @@ struct OnlineAnalysisNode : fair::mq::Device
                 c->Update();
             }
         }
+        fDetectorView.UpdateCanvases();
         if(gSystem) gSystem->ProcessEvents(); 
     }
 
@@ -704,15 +482,8 @@ private:
    std::map<uint32_t, std::vector<TH1F*>> fMapTDC;
    std::map<uint32_t, std::vector<TH1F*>> fMapTOT;
 
-   // channel map
    std::string fDefinitionName;
-   chmap::DetectorMap fDetMap;
-   bool fDetMapLoaded = false;
-   MapStamp fDetMapStamp;
-   std::vector<DetHists> fDetHists;
-   std::vector<std::size_t> fDetOffset;   // device index -> first entry in fDetHists
-   TH2F* fH2Unmapped = nullptr;
-   std::set<uint64_t> fUnmappedSeen;
+   DetectorView fDetectorView;
 
    std::vector<TCanvas*> fCanvases;
    

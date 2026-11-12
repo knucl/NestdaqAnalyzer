@@ -22,6 +22,7 @@ target_link_libraries(OnlineAnalysisSlicer
     FairLogger::FairLogger
     ${ROOT_LIBRARIES}
     ${Boost_LIBRARIES}
+    channel-map
 )
 
 # ------------------------------------------------------------------------------

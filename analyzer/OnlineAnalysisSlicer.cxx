@@ -21,6 +21,7 @@
 #include "TFSlicerUnpacker.h"
 #include "UnpackTdc.h"
 #include "KTimer.cxx" 
+#include "DetectorView.h"
 
 namespace bpo = boost::program_options;
 
@@ -28,6 +29,8 @@ struct OnlineAnalysisTrigger : fair::mq::Device
 {
     struct OptionKey {
         static constexpr std::string_view InputChannelName {"in-chan-name"};
+        static constexpr std::string_view ChannelMapName   {"channel-map"};
+        static constexpr std::string_view DefinitionName   {"detector-definition"};
     };
 
     OnlineAnalysisTrigger()
@@ -38,7 +41,10 @@ struct OnlineAnalysisTrigger : fair::mq::Device
     {
         using opt = OptionKey;
         fInputChannelName = fConfig->GetValue<std::string>(opt::InputChannelName.data());
-        LOG(info) << "InitTask: Input Channel = " << fInputChannelName;
+        fChannelMapName   = fConfig->GetValue<std::string>(opt::ChannelMapName.data());
+        fDefinitionName   = fConfig->GetValue<std::string>(opt::DefinitionName.data());
+        LOG(info) << "InitTask: Input Channel = " << fInputChannelName
+                  << ", detector definition = " << fDefinitionName << ", channel map = " << fChannelMapName;
 
         // Initialize ROOT Application
         gROOT->SetBatch(kTRUE);
@@ -80,12 +86,19 @@ struct OnlineAnalysisTrigger : fair::mq::Device
             fH1TrigTime->Reset();
         }
 
+        // Detector view: time relative to the trigger, same ranges as the FEM view; one event per slice
+        DetectorView::Ranges hr{2000, -1000000, 1000000, 200000, "Rel Time [ps]"};
+        DetectorView::Ranges lr{2000, -1000, 1000, 200, "Rel Time [ns]"};
+        fDetectorView.Configure(fServer, fDefinitionName, fChannelMapName, hr, lr, true);
+        fDetectorView.Reload();
+
         fDrawTimer.SetDuration(100); 
     }
 
     void PreRun() override
     {
         LOG(info) << "OnlineAnalysisTrigger: PreRun - Resetting histograms for new run.";
+        fDetectorView.Reload();
         ResetHistograms();
     }
 
@@ -108,6 +121,7 @@ struct OnlineAnalysisTrigger : fair::mq::Device
         for (auto& [id, h] : fMapChTDC) {
             if (h) h->Reset();
         }
+        fDetectorView.Reset();
         fLastTrigTime = 0;
         fFirstTrigTime = 0;
         fMsgCount = 0;
@@ -184,6 +198,7 @@ struct OnlineAnalysisTrigger : fair::mq::Device
             }
 
             // 2. Process Hits (per FEM)
+            fDetectorView.BeginEvent();
             for (auto const& [fem_id, tdc_data] : slice.data_by_fem) {
                 int max_ch = 0;
                 int multiplicity = 0;
@@ -251,10 +266,12 @@ struct OnlineAnalysisTrigger : fair::mq::Device
                         fMapTDC[fem_id][ch]->Fill(final_diff);
                         fMapTOT[fem_id][ch]->Fill(tot);
 												fMapChTDC[fem_id]->Fill(ch, final_diff);
+                        fDetectorView.Fill(fem_id, ch, final_diff, tot, is_hr);
                     }
                 } 
                 fMapMultiplicity[fem_id]->Fill(multiplicity);
             } 
+            fDetectorView.EndEvent();
         }
     }
     
@@ -360,11 +377,15 @@ if (is_hr) {
     }
     
     void UpdateDisplay() {
+        fDetectorView.UpdateCanvases();
         if (gSystem) gSystem->ProcessEvents(); 
     }
 
 private:
     std::string fInputChannelName;
+    std::string fChannelMapName;
+    std::string fDefinitionName;
+    DetectorView fDetectorView;
     TFSlicerUnpacker fUnpacker;
     uint64_t fMsgCount = 0;
     
@@ -396,7 +417,9 @@ void addCustomOptions(bpo::options_description& options)
 {
     using opt = OnlineAnalysisTrigger::OptionKey;
     options.add_options()
-        (opt::InputChannelName.data(), bpo::value<std::string>()->default_value("in"), "Name of the input channel");
+        (opt::InputChannelName.data(), bpo::value<std::string>()->default_value("in"), "Name of the input channel")
+        (opt::DefinitionName.data(), bpo::value<std::string>()->default_value(""), "Detector definition CSV (device, plane, segment, ch[, data])")
+        (opt::ChannelMapName.data(), bpo::value<std::string>()->default_value(""), "Channel map CSV (fe, fe.ch, device, plane, segment, ch[, data]); re-read at each run start when changed");
 }
 
 std::unique_ptr<fair::mq::Device> getDevice(fair::mq::ProgOptions& /*config*/)
