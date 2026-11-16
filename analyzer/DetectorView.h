@@ -4,7 +4,8 @@
 // channel-map/README.md) and, for each detector, plane and data kind:
 //   /Detector/<name>[/<plane>]/h_<name>_hitpat     hit pattern over segment x ch
 //   /Detector/<name>[/<plane>]/h_<name>_multi      hits per event (only when events are used)
-//   /Detector/<name>[/<plane>]/TDC/, TOT/          one histogram per channel
+//   /Detector/<name>[/<plane>]/TDC/, TOT/          one histogram per channel (HR ranges until
+//                                                  the first hit shows the FE is an LR-TDC)
 //   /Detector/<name>[/<plane>]/Canvases/           32 channels per 8x4 canvas
 //   /Detector/h2_unmapped                          hits on FE channels not in the map
 //
@@ -145,7 +146,14 @@ public:
         const int bin = a->segment * d.chs.size() + a->ch;
         s.hitpat->Fill(bin);
         ++s.event_hits;
-        if (s.tdc.empty()) CreateTimeHistograms(s, d, is_hr ? fRangesHR : fRangesLR);
+        if (!s.type_known) {
+            if (s.is_hr != is_hr) {
+                DeleteTimeHistograms(s);
+                CreateTimeHistograms(s, d, is_hr ? fRangesHR : fRangesLR);
+                s.is_hr = is_hr;
+            }
+            s.type_known = true;
+        }
         s.tdc[bin]->Fill(tdc);
         s.tot[bin]->Fill(tot);
     }
@@ -167,14 +175,16 @@ private:
     struct Set {
         TH1F* hitpat = nullptr;
         TH1F* multi  = nullptr;
-        std::vector<TH1F*> tdc;   // per channel; made at the first hit, with the ranges of its FE type
-        std::vector<TH1F*> tot;
+        std::vector<TH1F*> tdc;   // per channel; made with the HR ranges when the map is loaded,
+        std::vector<TH1F*> tot;   // and made again with the LR ranges if the first hit is from an LR-TDC
         std::vector<TCanvas*> canvases;
         std::string dir, name, title, xtitle;
         int  nbins   = 0;
         bool use_seg = false;
         bool use_ch  = false;
         int  event_hits = 0;
+        bool is_hr      = true;   // FE type the time histograms were made for
+        bool type_known = false;  // set at the first hit
     };
     using Stamp = std::pair<std::filesystem::file_time_type, std::filesystem::file_time_type>;
 
@@ -202,17 +212,28 @@ private:
         return label.empty() ? std::to_string(bin) : label;
     }
 
+    void DeleteTimeHistograms(Set& s)
+    {
+        for (auto* c : s.canvases) {   // canvases first: they draw the histograms below
+            if (fServer) fServer->Unregister(c);
+            delete c;
+        }
+        s.canvases.clear();
+        for (auto* v : {&s.tdc, &s.tot}) {
+            for (TH1* p : *v) {
+                if (!p) continue;
+                if (fServer) fServer->Unregister(p);
+                delete p;
+            }
+            v->clear();
+        }
+    }
+
     void Delete()
     {
         for (auto& s : fSets) {
-            for (auto* c : s.canvases) {   // canvases first: they draw the histograms below
-                if (fServer) fServer->Unregister(c);
-                delete c;
-            }
-            std::vector<TH1*> all{s.hitpat, s.multi};
-            all.insert(all.end(), s.tdc.begin(), s.tdc.end());
-            all.insert(all.end(), s.tot.begin(), s.tot.end());
-            for (TH1* p : all) {
+            DeleteTimeHistograms(s);
+            for (TH1* p : {static_cast<TH1*>(s.hitpat), static_cast<TH1*>(s.multi)}) {
                 if (!p) continue;
                 if (fServer) fServer->Unregister(p);
                 delete p;
@@ -253,6 +274,7 @@ private:
                                            s.nbins + 1, -0.5, s.nbins + 0.5);
                         if (fServer) fServer->Register(s.dir.c_str(), s.multi);
                     }
+                    CreateTimeHistograms(s, d, fRangesHR);
                     fSets.push_back(std::move(s));
                 }
             }
